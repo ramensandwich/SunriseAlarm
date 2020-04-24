@@ -2,3 +2,4 @@
 Debug/
 *.log
 .settings/
+alarm/inc/secrets.h
