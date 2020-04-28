@@ -1,60 +1,26 @@
 /*
- * @brief FreeRTOS Blinky example
+ * @brief SunriseAlarm
  *
- * @note
- * Copyright(C) NXP Semiconductors, 2012
- * All rights reserved.
- *
- * @par
- * Software that is described herein is for illustrative purposes only
- * which provides customers with programming information regarding the
- * LPC products.  This software is supplied "AS IS" without any warranties of
- * any kind, and NXP Semiconductors and its licensor disclaim any and
- * all warranties, express or implied, including all implied warranties of
- * merchantability, fitness for a particular purpose and non-infringement of
- * intellectual property rights.  NXP Semiconductors assumes no responsibility
- * or liability for the use of the software, conveys no license or rights under any
- * patent, copyright, mask work right, or any other intellectual property rights in
- * or to any products. NXP Semiconductors reserves the right to make changes
- * in the software without notification. NXP Semiconductors also makes no
- * representation or warranty that such application will be suitable for the
- * specified use without further testing or modification.
- *
- * @par
- * Permission to use, copy, modify, and distribute this software and its
- * documentation is hereby granted, under NXP Semiconductors' and its
- * licensor's relevant copyrights in the software, without fee, provided that it
- * is used in conjunction with NXP Semiconductors microcontrollers.  This
- * copyright, permission, and disclaimer notice must appear in all copies of
- * this code.
  */
 
 #include "board.h"
+#include "secrets.h"
+#include <stdlib.h>
+#include <string.h>
 
 #define I2C_FASTPLUS_BIT     0
-static int mode_poll;
+/* UART ring buffer sizes */
+#define UART_SRB_SIZE 128	/* Send */
+#define UART_RRB_SIZE 256	/* Receive */
+#define UART_BUF_SIZE 256
 
-static uint8_t iox_data[2];	/* PORT0 input port, PORT1 Output port */
-static volatile uint32_t tick_cnt;
+static int mode_poll;
 
 /* Transmit and receive ring buffers */
 STATIC RINGBUFF_T txring, rxring;
 
-/* Transmit and receive ring buffer sizes */
-#define UART_SRB_SIZE 128	/* Send */
-#define UART_RRB_SIZE 32	/* Receive */
+static uint8_t rxbuff[UART_RRB_SIZE], txbuff[UART_SRB_SIZE];
 
-/*****************************************************************************
- * Private types/enumerations/variables
- ****************************************************************************/
-
-/*****************************************************************************
- * Public types/enumerations/variables
- ****************************************************************************/
-
-/*****************************************************************************
- * Private functions
- ****************************************************************************/
 
 /* State machine handler for I2C0 and I2C1 */
 static void I2C_State_Handling(I2C_ID_T id)
@@ -91,6 +57,11 @@ static void I2C_Set_Mode(I2C_ID_T id, int polling)
 	}
 }
 
+/**
+ * @brief	Sets up the board I2C registers and interrupts
+ * 			Changes the board J2-40 and J2-41 pins from GPIO to UART
+ * @return	Nothing
+ */
 void Setup_I2C(void)
 {
 	//By default, these pins are GPIO. Need to set the mux to enable
@@ -104,6 +75,11 @@ void Setup_I2C(void)
 	I2C_Set_Mode(I2C0, 0);
 }
 
+/**
+ * @brief	Sets up the board UART registers and interrupts
+ * 			Changes the board J2-9 and J2-10 pins from GPIO to UART
+ * @return	Nothing
+ */
 void Setup_UART(void)
 {
 	Chip_IOCON_PinMuxSet(LPC_IOCON, IOCON_PIO1_6, (IOCON_FUNC1 | IOCON_MODE_INACT));/* RXD */
@@ -114,12 +90,29 @@ void Setup_UART(void)
 	Chip_UART_ConfigData(LPC_USART, (UART_LCR_WLEN8 | UART_LCR_SBS_1BIT));
 	Chip_UART_SetupFIFOS(LPC_USART, (UART_FCR_FIFO_EN | UART_FCR_TRG_LEV2));
 	Chip_UART_TXEnable(LPC_USART);
+
+	/* Before using the ring buffers, initialize them using the ring
+	   buffer init function */
+	RingBuffer_Init(&rxring, rxbuff, 1, UART_RRB_SIZE);
+	RingBuffer_Init(&txring, txbuff, 1, UART_SRB_SIZE);
+
+	/* Enable receive data and line status interrupt */
+	Chip_UART_IntEnable(LPC_USART, (UART_IER_RBRINT | UART_IER_RLSINT));
+
+	/* preemption = 1, sub-priority = 1 */
+	NVIC_SetPriority(UART0_IRQn, 1);
+	NVIC_EnableIRQ(UART0_IRQn);
 }
 
+/**
+ * @brief	Sends through UART using ring buffers
+ * @return	Number of bytes sent
+ */
 int Send_UART(char* message, int message_length)
 {
 	//TODO: Don't hardcode buffer size
-	char buf[48];
+	//TODO: Validate that message_length is less than buffer size
+	char buf[48] = {0};
 
 	for (int i = 0; i < message_length; i++)
 	{
@@ -128,23 +121,76 @@ int Send_UART(char* message, int message_length)
 	buf[message_length] = '\r';
 	buf[message_length + 1] = '\n';
 
-	return Chip_UART_SendBlocking(LPC_USART, buf, message_length+2);
+	int retCount = 0;
 
+	retCount = Chip_UART_SendRB(LPC_USART, &txring, buf, message_length+2);
+
+	//After sending the data, listen back for the echo so the command will execute
+	//The ESP8266 does not execute commands until after it finishes echoing
+	//Note: There is a bug(?) that the device echoes back our sent command with an extra '\r'.
+	//Need to account for this when expecting bytes back
+	int res = 1;
+	char readChar = 0;
+	int count = 0;
+	memset(buf, 0, 48);
+	int newline_read_count = 0;
+	//Echo format is [command]\r\r\n\r\n
+	while (newline_read_count < 2)
+	{
+		res = Chip_UART_ReadRB(LPC_USART, &rxring, &readChar, 1);
+		buf[count] = readChar;
+		if (res != 0) count++;
+		if (readChar == '\n') newline_read_count++;
+	}
+
+	return retCount;
 }
 
-/*****************************************************************************
- * Public functions
- ****************************************************************************/
+/**
+ * @brief	Reads from the UART using ring buffers
+ * @return	number of bytes read
+ */
+int Read_UART(char* buf, int max_bytes, bool is_wifi)
+{
+	int count = 0;
+	int res = 1;
+	int expected_newlines = 1;
+	if (is_wifi) expected_newlines = 3;
+	int counted_newlines = 0;
+	while ((res != 0 || counted_newlines < expected_newlines) && count < max_bytes)
+	{
+		res = Chip_UART_ReadRB(LPC_USART, &rxring, &(buf[count]), 1);
+		if (buf[count] == '\n') counted_newlines++;
+		if (res != 0) count++;
+	}
+
+	//TODO: Return -1 if the chip replies with an error
+
+	return count;
+}
 
 /**
- * @brief	main routine for FreeRTOS blinky example
+ * @brief	UART interrupt handler using ring buffers
+ * @return	Nothing
+ */
+void UART_IRQHandler(void)
+{
+	/* Want to handle any errors? Do it here. */
+
+	/* Use default ring buffer handler. Override this with your own
+	   code if you need more capability. */
+	Chip_UART_IRQRBHandler(LPC_USART, &rxring, &txring);
+}
+
+/**
+ * @brief	main routine for SunriseAlarm
  * @return	Nothing, function should not exit
  */
 int main(void)
 {
 	static I2C_XFER_T xfer;
 	uint8_t buf[17] = {0};
-	uint8_t UARTBuf[48] = {0};
+	uint8_t UARTBuf[UART_BUF_SIZE] = {0};
 
 	SystemCoreClockUpdate();
 	Board_Init();
@@ -189,67 +235,45 @@ int main(void)
 
 	//Check chip connection status
 	res = Send_UART("AT", 2);
-//	UARTBuf[0] = 'A';
-//	UARTBuf[1] = 'T';
-//	UARTBuf[2] = '\r';
-//	UARTBuf[3] = '\n';
-//	res = Chip_UART_SendBlocking(LPC_USART, UARTBuf, 48);
-	//Expecting 'OK'
-	//Don't forget that the device echos back what we send. TODO: Disable that?
-	//Note: There is a bug(?) that the device echoes back our sent command with an extra '\r'.
-	//Need to account for this when expecting bytes back
-	//msglen + 5 (\r\r\n\r\n) + 2 (OK) + 2 (\r\n)
-	//Seems like we run out of buffer space or something. Only able to read 15 or 16 bytes
-	//before bytes get dropped.
-	//TODO: Use ring buffer instead?
-	res = Chip_UART_Read(LPC_USART, UARTBuf, 48);
-	while (res != 0)
-	{
-		res = Chip_UART_Read(LPC_USART, UARTBuf, 48);
-	}
+	memset(UARTBuf, 0, UART_BUF_SIZE);
+	Read_UART(UARTBuf, UART_BUF_SIZE, false);
 
+	//Reset the chip and its settings
 	res = Send_UART("AT+RST", 6);
-	res = Chip_UART_Read(LPC_USART, UARTBuf, 48);
-	while (res != 0)
-	{
-		res = Chip_UART_Read(LPC_USART, UARTBuf, 48);
-	}
+	memset(UARTBuf, 0, UART_BUF_SIZE);
+	res = Read_UART(UARTBuf, UART_BUF_SIZE, false);
 
+	//Check chip connection status
 	res = Send_UART("AT", 2);
-	res = Chip_UART_Read(LPC_USART, UARTBuf, 48);
-	while (res != 0)
-	{
-		res = Chip_UART_Read(LPC_USART, UARTBuf, 48);
-	}
+	memset(UARTBuf, 0, UART_BUF_SIZE);
+	res = Read_UART(UARTBuf, UART_BUF_SIZE, false);
 
-	res = Send_UART("AT+CWJAP=\"SSID\",\"PASSWORD\"", 32);
-	res = Chip_UART_Read(LPC_USART, UARTBuf, 48);
-	while (res != 0)
-	{
-		res = Chip_UART_Read(LPC_USART, UARTBuf, 48);
-	}
+	//Set to station mode
+	res = Send_UART("AT+CWMODE=3", 11);
+	memset(UARTBuf, 0, UART_BUF_SIZE);
+	res = Read_UART(UARTBuf, UART_BUF_SIZE, false);
 
-	res = Send_UART("AT+CIPSTART=\"UDP\",\"time.nist.gov\",123", 37);
-	res = Chip_UART_Read(LPC_USART, UARTBuf, 48);
-
-	//Connect to WIFI
-	//TODO: Don't commit secrets
-	//AT+CWJAP="SSID","PASSWORD"
-	Chip_UART_SendBlocking(LPC_USART, UARTBuf, 2);
-	//Expecting 'OK'
-	Chip_UART_ReadBlocking(LPC_USART, UARTBuf, 2);
-
-	//AT+CWMODE=3\r\n
+	//Connect to access point
+	char* APInfo = APSTRING;
+	res = Send_UART(APInfo, strlen(APInfo));
+	memset(UARTBuf, 0, UART_BUF_SIZE);
+	//If already connected to AP, it will disconnect, then reconnect
+	res = Read_UART(UARTBuf, UART_BUF_SIZE, true);
 
 	//Create a connection to the nist NTP server
-	//AT+CIPSTART="UDP","time.nist.gov",123
+	res = Send_UART("AT+CIPSTART=\"UDP\",\"time.nist.gov\",123", 37);
+	memset(UARTBuf, 0, UART_BUF_SIZE);
+	res = Read_UART(UARTBuf, UART_BUF_SIZE, false);
 
 	//Send request byte to the nist NTP server
 	//AT+CIPSEND=48
-
+	res = Send_UART("AT+CIPSEND=3", 13);
 	//0b11100011
 	UARTBuf[0] = 0xE3;
+	res = Send_UART(UARTBuf, 1);
 
+	memset(UARTBuf, 0, UART_BUF_SIZE);
+	res = Read_UART(UARTBuf, UART_BUF_SIZE, false);
 
 
 	//Note: NTP epoch is 1 January 1900, different than UNIX epoch
